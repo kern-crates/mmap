@@ -4,22 +4,29 @@
 #[macro_use]
 extern crate log;
 extern crate alloc;
-use axerrno::LinuxResult;
+use axerrno::{LinuxResult, LinuxError, linux_err};
 use axfile::fops::File;
-use axhal::arch::TASK_UNMAPPED_BASE;
+use axhal::arch::STACK_TOP;
 use axhal::mem::{phys_to_virt, virt_to_phys};
+use axhal::arch::user_mode;
 use axio::SeekFrom;
 use core::ops::Bound;
 use memory_addr::{align_up_4k, align_down_4k, is_aligned_4k, PAGE_SHIFT, PAGE_SIZE_4K};
 pub use mm::FileRef;
 use mm::VmAreaStruct;
-use axerrno::LinuxError;
 use axhal::arch::TASK_SIZE;
-use mm::{VM_READ, VM_WRITE, VM_EXEC};
+use mm::{VM_READ, VM_WRITE, VM_EXEC, VM_SHARED, VM_MAYSHARE};
+use mm::{VM_MAYREAD, VM_MAYWRITE, VM_MAYEXEC};
+use mm::{VM_GROWSDOWN, VM_LOCKED, VM_SYNC};
 #[cfg(target_arch = "riscv64")]
 use axhal::arch::{EXC_INST_PAGE_FAULT, EXC_LOAD_PAGE_FAULT, EXC_STORE_PAGE_FAULT};
-use task::SIGSEGV;
+#[cfg(target_arch = "riscv64")]
 use signal::force_sig_fault;
+use capability::Cap;
+use axhal::arch::flush_tlb;
+
+/// enforced gap between the expanding stack and other mappings.
+const STACK_GUARD_GAP: usize = 256 << PAGE_SHIFT;
 
 pub const PROT_READ: usize = 0x1;
 pub const PROT_WRITE: usize = 0x2;
@@ -29,10 +36,12 @@ pub const PROT_NONE: usize = 0x0;
 pub const PROT_GROWSDOWN: usize = 0x01000000;
 pub const PROT_GROWSUP: usize = 0x02000000;
 
+/// Mask for type of mapping
+const MAP_TYPE: usize = 0x0f;
 /// Share changes
-const MAP_SHARED: usize = 0x01;
+pub const MAP_SHARED: usize = 0x01;
 /// Changes are private
-const MAP_PRIVATE: usize = 0x02;
+pub const MAP_PRIVATE: usize = 0x02;
 /// share + validate extension flags
 const MAP_SHARED_VALIDATE: usize = 0x03;
 
@@ -51,6 +60,8 @@ const MAP_EXECUTABLE: usize= 0x1000;
 const MAP_LOCKED: usize    = 0x2000;
 /// don't check for reservations */
 const MAP_NORESERVE: usize = 0x4000;
+/// perform synchronous page faults for the mapping
+const MAP_SYNC: usize = 0x080000;
 
 const MAP_32BIT: usize = 0;
 const MAP_HUGE_2MB: usize = 0;
@@ -74,6 +85,17 @@ pub const MAP_FIXED_NOREPLACE: usize = 0x100000;
 /// For anonymous mmap, memory could be uninitialized
 const MAP_UNINITIALIZED: usize = 0x4000000;
 
+pub const VM_FAULT_OOM:     usize = 0x000001;
+pub const VM_FAULT_SIGBUS:  usize = 0x000002;
+pub const VM_FAULT_HWPOISON:usize = 0x000010;
+pub const VM_FAULT_HWPOISON_LARGE: usize = 0x000020;
+pub const VM_FAULT_SIGSEGV: usize = 0x000040;
+pub const VM_FAULT_FALLBACK:usize = 0x000800;
+
+pub const VM_FAULT_ERROR: usize =
+    VM_FAULT_OOM | VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV | VM_FAULT_HWPOISON |
+    VM_FAULT_HWPOISON_LARGE | VM_FAULT_FALLBACK;
+
 const LEGACY_MAP_MASK: usize =
     MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS | MAP_DENYWRITE |
     MAP_EXECUTABLE | MAP_UNINITIALIZED | MAP_GROWSDOWN | MAP_LOCKED | MAP_NORESERVE |
@@ -88,14 +110,19 @@ pub fn mmap(
     fd: usize,
     offset: usize,
 ) -> LinuxResult<usize> {
+    if (flags & MAP_ANONYMOUS) == 0 {
+        if fd == usize::MAX {
+            return Err(LinuxError::EBADF);
+        }
+    }
+    if len == 0 {
+        return Err(LinuxError::EINVAL);
+    }
     let current = task::current();
     let filetable = current.filetable.lock();
     let file = if (flags & MAP_ANONYMOUS) != 0 {
         None
     } else {
-        if fd == usize::MAX {
-            return Err(LinuxError::EBADF);
-        }
         if (flags & MAP_SHARED_VALIDATE) == MAP_SHARED_VALIDATE {
             // Todo: flags_mask also includes file->f_op->mmap_supported_flags
             let flags_mask = LEGACY_MAP_MASK;
@@ -103,12 +130,54 @@ pub fn mmap(
                 return Err(LinuxError::EOPNOTSUPP);
             }
         }
-        filetable.get_file(fd)
+        let f = filetable.get_file(fd);
+        check_file_mode(flags, prot, f.clone())?;
+        f
     };
-    if len == 0 {
+    let va = _mmap(va, len, prot, flags, file, offset)?;
+
+    if (flags & MAP_POPULATE) != 0 {
+        assert!(is_aligned_4k(va));
+        assert!(is_aligned_4k(len));
+        error!("MAP_POPULATE");
+        let mut pos = 0;
+        while pos < len {
+            let mut _fixup = 0;
+            let _ = faultin_page(va + pos, 0, 0, &mut _fixup);
+            pos += PAGE_SIZE_4K;
+        }
+    }
+    Ok(va)
+}
+
+fn check_file_mode(flags: usize, prot: usize, file: Option<FileRef>) -> LinuxResult {
+    let cap = file.ok_or(LinuxError::ENOENT)?.lock().get_cap();
+    let mut flags = flags & MAP_TYPE;
+    if flags == MAP_SHARED {
+        /*
+         * Force use of MAP_SHARED_VALIDATE with non-legacy
+         * flags. E.g. MAP_SYNC is dangerous to use with
+         * MAP_SHARED as you don't know which consistency model
+         * you will get. We silently ignore unsupported flags
+         * with MAP_SHARED to preserve backward compatibility.
+         */
+        flags &= LEGACY_MAP_MASK;
+    }
+    if flags == MAP_SHARED_VALIDATE {
+        if (prot & PROT_WRITE) != 0 {
+            if !cap.contains(Cap::WRITE) {
+                return Err(LinuxError::EACCES);
+            }
+        }
+    }
+    if flags == MAP_PRIVATE || flags == MAP_SHARED || flags == MAP_SHARED_VALIDATE {
+        if !cap.contains(Cap::READ) {
+            return Err(LinuxError::EACCES);
+        }
+    } else {
         return Err(LinuxError::EINVAL);
     }
-    _mmap(va, len, prot, flags, file, offset)
+    Ok(())
 }
 
 pub fn _mmap(
@@ -138,7 +207,7 @@ pub fn _mmap(
     }
 
     let mm = task::current().mm();
-    if let Some(mut overlap) = find_overlap(va, len) {
+    if let Some(mut overlap) = cut_overlap(va, len) {
         debug!("find overlap {:#X}-{:#X}", overlap.vm_start, overlap.vm_end);
         assert!(
             overlap.vm_start <= va && va + len <= overlap.vm_end,
@@ -166,8 +235,13 @@ pub fn _mmap(
         }
     }
 
-    let vm_flags = calc_vm_prot_bits(prot);
-    info!(
+    let mut vm_flags = calc_vm_prot_bits(prot) | calc_vm_flag_bits(flags)
+        | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+
+    if (flags & MAP_SHARED) != 0 {
+        vm_flags |= VM_SHARED | VM_MAYSHARE;
+    }
+    debug!(
         "mmap region: {:#X} - {:#X}, vm_flags: {:#X}, prot {:#X}",
         va,
         va + len,
@@ -176,6 +250,10 @@ pub fn _mmap(
     );
     let vma = VmAreaStruct::new(va, va + len, offset >> PAGE_SHIFT, file, vm_flags);
     mm.lock().vmas.insert(va, vma);
+
+    if (flags & MAP_LOCKED) != 0 {
+        mm.lock().locked_vm = len >> PAGE_SHIFT;
+    }
 
     Ok(va)
 }
@@ -197,18 +275,40 @@ fn calc_vm_prot_bits(prot: usize) -> usize {
     flags
 }
 
-fn find_overlap(va: usize, len: usize) -> Option<VmAreaStruct> {
-    debug!("find_overlap: va {:#X} len {:#X}", va, len);
+/*
+ * Combine the mmap "flags" argument into "vm_flags" used internally.
+ */
+fn calc_vm_flag_bits(flags: usize) -> usize {
+    let mut vm_flags = 0;
+    if (flags & MAP_GROWSDOWN) != 0 {
+        vm_flags |= VM_GROWSDOWN;
+    }
+    if (flags & MAP_LOCKED) != 0 {
+        vm_flags |= VM_LOCKED;
+    }
+    if (flags & MAP_SYNC) != 0 {
+        vm_flags |= VM_SYNC;
+    }
+    vm_flags
+}
 
+fn find_overlap(va: usize, len: usize) -> Option<usize> {
     let mm = task::current().mm();
     let locked_mm = mm.lock();
-    let ret = locked_mm.vmas.iter().find(|(_, vma)| {
+    locked_mm.vmas.iter().find(|(_, vma)| {
         in_vma(va, va + len, vma) || in_range(vma.vm_start, vma.vm_end, va, va + len)
-    });
+    }).map(|(key, _)| {
+        *key
+    })
+}
 
-    if let Some((key, _)) = ret {
+fn cut_overlap(va: usize, len: usize) -> Option<VmAreaStruct> {
+    debug!("cut_overlap: va {:#X} len {:#X}", va, len);
+
+    if let Some(key) = find_overlap(va, len) {
         warn!("### Removed!!!");
-        mm.lock().vmas.remove(&key)
+        let current = task::current();
+        current.mm().lock().vmas.remove(&key)
     } else {
         None
     }
@@ -224,10 +324,20 @@ const fn in_vma(start: usize, end: usize, vma: &VmAreaStruct) -> bool {
     in_range(start, end, vma.vm_start, vma.vm_end)
 }
 
-pub fn get_unmapped_vma(_va: usize, len: usize) -> usize {
+fn mmap_base() -> usize {
+    const MIN_GAP: usize = 0x800_0000; // SZ_128M
+    STACK_TOP - MIN_GAP
+}
+
+pub fn get_unmapped_vma(va: usize, len: usize) -> usize {
+    debug!("get_unmapped_vma va {:#x} len {:#x}", va, len);
+    if va != 0 && find_overlap(va, len).is_none() {
+        return va;
+    }
+
     let mm = task::current().mm();
     let locked_mm = mm.lock();
-    let mut gap_end = TASK_UNMAPPED_BASE;
+    let mut gap_end = mmap_base();
     for (_, vma) in locked_mm.vmas.iter().rev() {
         debug!(
             "get_unmapped_vma iterator: {:#X} {:#X} {:#X}",
@@ -254,41 +364,88 @@ pub fn get_unmapped_vma(_va: usize, len: usize) -> usize {
 }
 
 // invalid permissions for mapped object
+#[cfg(target_arch = "riscv64")]
 const SEGV_ACCERR: usize = 2;
 
-pub fn faultin_page(va: usize, cause: usize) -> usize {
+pub fn faultin_page(
+    va: usize, cause: usize, epc: usize, fixup: &mut usize,
+) -> Result<usize, usize> {
     let va = align_down_4k(va);
     info!("--------- faultin_page... va {:#X} cause {}", va, cause);
     let mm = task::current().mm();
     let mut locked_mm = mm.lock();
     if locked_mm.mapped.get(&va).is_some() {
         warn!("============== find page {:#X} already exists!", va);
-        return 0;
+        return Ok(0);
     }
 
-    let vma = locked_mm
-        .vmas
-        .upper_bound(Bound::Included(&va))
-        .value()
-        .unwrap();
-    assert!(
-        va >= vma.vm_start && va < vma.vm_end,
-        "va {:#X} in {:#X} - {:#X}",
-        va,
-        vma.vm_start,
-        vma.vm_end
-    );
+    let cursor = locked_mm.vmas.upper_bound(Bound::Included(&va));
+    let mut vma = cursor.value().unwrap();
+    if va < vma.vm_start || va >= vma.vm_end {
+        let (_, next_vma) = cursor.peek_next().unwrap();
+        info!("{:#X} - {:#X}; {:#x} pgoff {:#x}",
+            next_vma.vm_start, next_vma.vm_end, next_vma.vm_flags, next_vma.vm_pgoff);
+
+        if (next_vma.vm_flags & VM_GROWSDOWN) != 0 {
+            // Todo: wrap these into a function 'expand_stack'
+            assert!(next_vma.vm_file.get().is_none());
+            assert_eq!(next_vma.vm_pgoff, 0);
+
+            // Check that both stack segments have the same anon_vma?
+            if (vma.vm_flags & VM_GROWSDOWN) == 0 {
+                if va - vma.vm_end < STACK_GUARD_GAP {
+                    error!("SEGV_ACCERR");
+                    let tid = task::current().tid();
+                    force_sig_fault(tid, task::SIGSEGV, SEGV_ACCERR, va);
+                    return Err(usize::MAX);
+                }
+            }
+
+            let stack = VmAreaStruct::new(va, next_vma.vm_start, 0, None, next_vma.vm_flags);
+            locked_mm.vmas.insert(va, stack);
+            vma = locked_mm.vmas.get(&va).unwrap();
+        }
+    }
+    if va < vma.vm_start || va >= vma.vm_end {
+        error!("va {:#X} in {:#X} - {:#X}", va, vma.vm_start, vma.vm_end);
+        let tid = task::current().tid();
+        force_sig_fault(tid, task::SIGSEGV, SEGV_ACCERR, va);
+        return Err(usize::MAX);
+    }
 
     #[cfg(target_arch = "riscv64")]
     {
         if access_error(cause, vma) {
-            bad_area(SEGV_ACCERR, va);
-            return usize::MAX;
+            // tsk->thread.bad_cause = cause;
+            return bad_area(va, epc, fixup);
         }
     }
 
     let delta = va - vma.vm_start;
     let offset = (vma.vm_pgoff << PAGE_SHIFT) + delta;
+
+    if let Some(f) = vma.vm_file.get() {
+        let f = f.lock();
+        if f.get_attr().unwrap().is_file() {
+            let f_size = f.get_attr().unwrap().size() as usize;
+            if offset >= f_size {
+                debug!("offset {} >= f_size {}", offset, f_size);
+                return Err(VM_FAULT_SIGBUS);
+            }
+        }
+    }
+
+    if (vma.vm_flags & VM_SHARED) != 0 {
+        assert!(vma.vm_file.get().is_some());
+        let f = vma.vm_file.get().unwrap().clone();
+        let f = f.lock();
+        if let Some(pa) = f.shared_map.get(&offset) {
+            locked_mm.map_region(va, *pa, PAGE_SIZE_4K, 1)
+                .unwrap_or_else(|e| { panic!("{:?}", e) });
+
+            return Ok(phys_to_virt((*pa).into()).into());
+        }
+    }
 
     let direct_va: usize = axalloc::global_allocator()
         .alloc_pages(1, PAGE_SIZE_4K)
@@ -303,14 +460,81 @@ pub fn faultin_page(va: usize, cause: usize) -> usize {
     if vma.vm_file.get().is_some() {
         let f = vma.vm_file.get().unwrap().clone();
         fill_cache(pa, PAGE_SIZE_4K, &mut f.lock(), offset);
+        if (vma.vm_flags & VM_SHARED) != 0 {
+            f.lock().shared_map.insert(offset, pa);
+        }
     }
     locked_mm.map_region(va, pa, PAGE_SIZE_4K, 1)
         .unwrap_or_else(|e| { panic!("{:?}", e) });
 
-    // Todo: temporarily record mapped va->pa(direct_va)
-    locked_mm.mapped.insert(va, direct_va);
+    if (vma.vm_flags & VM_SHARED) == 0 {
+        // Todo: temporarily record mapped va->pa(direct_va)
+        locked_mm.mapped.insert(va, direct_va);
+    }
 
-    phys_to_virt(pa.into()).into()
+    Ok(phys_to_virt(pa.into()).into())
+}
+
+#[cfg(target_arch = "riscv64")]
+fn bad_area(va: usize, epc: usize, fixup: &mut usize) -> Result<usize, usize> {
+    //
+    // Something tried to access memory that isn't in our memory map.
+    // Fix it, but check if it's kernel or user first.
+    //
+    // mmap_read_unlock(mm);
+
+    // User mode accesses just cause a SIGSEGV
+    if user_mode() {
+        let tid = task::current().tid();
+        force_sig_fault(tid, task::SIGSEGV, SEGV_ACCERR, va);
+        return Err(usize::MAX);
+    }
+    no_context(epc, fixup)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn no_context(epc: usize, fixup: &mut usize) -> Result<usize, usize> {
+    // Are we prepared to handle this kernel fault?
+    if let Some(addr) = fixup_exception(epc) {
+        *fixup = addr;
+        return Err(usize::MAX);
+    }
+    unreachable!("no_context!");
+}
+
+fn search_exception_table(epc: usize) -> Option<usize> {
+    extern "C" {
+        fn __start___ex_table();
+        fn __stop___ex_table();
+    }
+
+    let mut start = __start___ex_table as usize;
+    let stop = __stop___ex_table as usize;
+    error!("search ex_table {:#x} {:#x}", start, stop);
+
+    while start < stop {
+        let ptr = start as *const usize;
+        let addr = unsafe { *ptr };
+        start += 8;
+
+        let ptr = start as *const usize;
+        let fixup = unsafe { *ptr };
+        start += 8;
+
+        error!("{:#x} -> {:#x}", addr, fixup);
+
+        if addr == epc {
+            return Some(fixup);
+        }
+    }
+
+    panic!("no fixup!");
+    //None
+}
+
+#[cfg(target_arch = "riscv64")]
+fn fixup_exception(epc: usize) -> Option<usize> {
+    search_exception_table(epc)
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -319,7 +543,7 @@ fn access_error(cause: usize, vma: &VmAreaStruct) -> bool {
     if cause == 0 {
         return false;
     }
-    info!("cause {} flags {:#X}", cause, vma.vm_flags);
+    debug!("cause {} flags {:#X}", cause, vma.vm_flags);
     match cause {
         EXC_INST_PAGE_FAULT => {
             (vma.vm_flags & VM_EXEC) == 0
@@ -337,22 +561,9 @@ fn access_error(cause: usize, vma: &VmAreaStruct) -> bool {
     }
 }
 
-fn bad_area(code: usize, addr: usize) {
-    // User mode accesses just cause a SIGSEGV
-    // Todo: makesure now we are in userland.
-    // #define user_mode(regs) (((regs)->status & SR_PP) == 0)
-    error!("code {} addr {:#X}", code, addr);
-    do_trap(SIGSEGV, code, addr);
-}
-
-fn do_trap(signo: usize, code: usize, addr: usize) {
-    force_sig_fault(signo, code, addr);
-}
-
 fn fill_cache(pa: usize, len: usize, file: &mut File, offset: usize) {
     let offset = align_down_4k(offset);
     let va = phys_to_virt(pa.into()).as_usize();
-
     let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, len) };
 
     debug!("fill_cache: offset {:#X} len {:#X}", offset, len);
@@ -386,7 +597,8 @@ pub fn set_brk(va: usize) -> usize {
         assert!(is_aligned_4k(offset));
         _mmap(brk, offset, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANONYMOUS, None, 0).unwrap();
         // Todo: set proper cause for faultin_page.
-        let _ = faultin_page(brk, 0 /* cause */);
+        let mut _fixup = 0;
+        let _ = faultin_page(brk, 0 /* cause */, 0, &mut _fixup);
         mm.lock().set_brk(va);
         va
     }
@@ -422,9 +634,14 @@ pub fn msync(va: usize, len: usize, flags: usize) -> usize {
     0
 }
 
-fn sync_file(va: usize, len: usize, file: &mut File, offset: usize) {
+fn sync_file(va: usize, mut len: usize, file: &mut File, offset: usize) {
+    let f_size = file.get_attr().unwrap().size() as usize;
+    if len > f_size {
+        // msync: length of msync cannot overflow the original file size.
+        // LTP - mmap01
+        len = f_size;
+    }
     let buf = unsafe { core::slice::from_raw_parts(va as *const u8, len) };
-
     let _ = file.seek(SeekFrom::Start(offset as u64));
 
     let mut pos = 0;
@@ -439,12 +656,26 @@ fn sync_file(va: usize, len: usize, file: &mut File, offset: usize) {
 }
 
 pub fn munmap(va: usize, mut len: usize) -> usize {
+    if !is_aligned_4k(va) || va > TASK_SIZE || len > TASK_SIZE-va {
+        return linux_err!(EINVAL);
+    }
+
     assert!(is_aligned_4k(va));
     len = align_up_4k(len);
-    debug!("munmap {:#X} - {:#X}", va, va + len);
+    if len == 0 {
+        return linux_err!(EINVAL);
+    }
 
-    if let Some(mut overlap) = find_overlap(va, len) {
+    info!("munmap {:#x} - {:#x}", va, va + len);
+
+    while let Some(mut overlap) = cut_overlap(va, len) {
         debug!("find overlap {:#X}-{:#X}", overlap.vm_start, overlap.vm_end);
+        if va <= overlap.vm_start && overlap.vm_end <= va + len {
+            let len = overlap.vm_end - overlap.vm_start;
+            let _ = remove_region(overlap.vm_start, len);
+            continue;
+        }
+
         assert!(
             overlap.vm_start <= va && va + len <= overlap.vm_end,
             "{:#X}-{:#X}; overlap {:#X}-{:#X}",
@@ -467,19 +698,64 @@ pub fn munmap(va: usize, mut len: usize) -> usize {
             let mm = task::current().mm();
             mm.lock().vmas.insert(overlap.vm_start, overlap);
         }
+        let _ = remove_region(va, len);
     }
 
+    0
+}
+
+pub fn mremap(
+    oaddr: usize, mut osize: usize, mut nsize: usize, flags: usize, naddr: usize
+) -> usize {
+    assert_eq!(flags, 0);
+    assert_eq!(naddr, 0);
+    assert!(is_aligned_4k(oaddr));
+    osize = align_up_4k(osize);
+    nsize = align_up_4k(nsize);
+
+    error!("mremap oaddr {:#x} osize {:#x} nsize {:#x}, flags {:#x} naddr {:#x}",
+        oaddr, osize, nsize, flags, naddr);
+
+    let mut area = cut_overlap(oaddr, osize).unwrap_or_else(|| {
+        panic!("no area {:#x} : {:#x}", oaddr, osize);
+    });
+    assert_eq!(oaddr, area.vm_start);
+    assert_eq!(oaddr+osize, area.vm_end);
+
+    if let Some(next_area) = find_next_area(oaddr + nsize) {
+        error!("{:#x} next_area: {:#x}", oaddr + nsize, next_area.vm_start);
+        assert!(oaddr + nsize <= next_area.vm_start);
+    }
+
+    area.vm_end = area.vm_start + nsize;
+
+    let mm = task::current().mm();
+    mm.lock().vmas.insert(area.vm_start, area);
+    oaddr
+}
+
+fn find_next_area(cur_end: usize) -> Option<VmAreaStruct> {
+    let mm = task::current().mm();
+    let locked_mm = mm.lock();
+    let cursor = locked_mm.vmas.lower_bound(Bound::Excluded(&cur_end));
+    cursor.peek_prev().map(|(_, area)| area.clone())
+}
+
+fn remove_region(va: usize, len: usize) -> usize {
     let mm = task::current().mm();
     let mut locked_mm = mm.lock();
     // Todo: handle temporary mmaped.
     locked_mm.mapped.remove(&va);
+    debug!("remove_region va {:#x} len {:#x}", va, len);
     match locked_mm.unmap_region(va, len) {
-        Ok(_) => 0,
+        Ok(_) => {
+            flush_tlb(None);
+        },
         Err(e) => {
             warn!("unmap region err: {:#?}", e);
-            0
         },
     }
+    0
 }
 
 pub fn mprotect(va: usize, len: usize, prot: usize) -> usize {
@@ -488,7 +764,7 @@ pub fn mprotect(va: usize, len: usize, prot: usize) -> usize {
 
     let mut vma;
     let mm = task::current().mm();
-    if let Some(mut overlap) = find_overlap(va, len) {
+    if let Some(mut overlap) = cut_overlap(va, len) {
         debug!("find overlap {:#X}-{:#X}", overlap.vm_start, overlap.vm_end);
         assert!(
             overlap.vm_start <= va && va + len <= overlap.vm_end,
